@@ -2099,6 +2099,13 @@ def sample_inputs_masked_select(op_info, device, dtype, requires_grad, **kwargs)
 
     return samples
 
+def sample_inputs_matrix_exp(op_info, device, dtype, requires_grad, **kwargs):
+    samples = (
+        SampleInput(make_tensor((S, S), device, dtype, requires_grad=requires_grad)),
+        SampleInput(make_tensor((S, S, S), device, dtype, requires_grad=requires_grad)),
+    )
+
+    return samples
 
 def sample_inputs_matmul(op_info, device, dtype, requires_grad):
     test_cases = (((L,), (L,)),
@@ -3434,6 +3441,11 @@ op_db: List[OpInfo] = [
                # https://github.com/pytorch/pytorch/issues/55755
                SkipInfo('TestOpInfo', 'test_unsupported_dtypes',
                         device_type='cpu', dtypes=(torch.float16,)),)),
+    OpInfo('matrix_exp',
+           dtypesIfCPU=floating_and_complex_types_and(torch.bfloat16),
+           dtypesIfCUDA=floating_and_complex_types_and(torch.float16),
+           sample_inputs_func=sample_inputs_matrix_exp,
+           supports_out=False),
     OpInfo('max',
            op=torch.max,
            variant_test_name='binary',
@@ -4682,8 +4694,6 @@ def method_tests():
         ('mv', (S, M), ((M,),), '', (True,)),
         ('inner', (S,), ((S,),), "1d_1d", (False,)),
         ('inner', (), ((S, S),), "scalar_2d", (False,)),
-        ('matrix_exp', (S, S), NO_ARGS, "single_matrix"),
-        ('matrix_exp', (S, S, S), NO_ARGS, "batch_of_matrices"),
         ('mvlgamma', torch.empty(S,).uniform_(0.5, 1), [1], "p=1"),
         ('mvlgamma', torch.empty(S,).uniform_(1, 2), [2], "p=2"),
         ('mvlgamma', torch.empty(S, S).uniform_(1.5, 3), [3], "p=3"),
