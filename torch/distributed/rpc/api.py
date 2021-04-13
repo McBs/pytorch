@@ -1,6 +1,7 @@
 import collections
 import contextlib
 import functools
+import hashlib
 import inspect
 import logging
 import threading
@@ -38,9 +39,13 @@ from .internal import (
 
 from .constants import DEFAULT_SHUTDOWN_TIMEOUT, UNSET_RPC_TIMEOUT
 
-
 logger = logging.getLogger(__name__)
-
+import sys
+out_hdlr = logging.StreamHandler(sys.stdout)
+out_hdlr.setFormatter(logging.Formatter('p%(process)s {%(pathname)s:%(lineno)d} - %(message)s'))
+out_hdlr.setLevel(logging.INFO)
+logger.addHandler(out_hdlr)
+logger.setLevel(logging.INFO)
 
 # NB: Ignoring RRef leaks during shutdown. Without this, applications have to
 # make sure there is no references to any RRef in the application code and
@@ -116,11 +121,13 @@ def _init_rpc_states(agent):
         _set_and_start_rpc_agent(agent)
 
 
-def _gather_to_leader(sequence_id, worker_name, obj):
+def _gather_to_leader(sequence_id, worker_name, obj, worker_names=None):
     with _all_gather_dict_lock:
-        assert (
-            worker_name in _ALL_WORKER_NAMES
-        ), "{worker_name} is not expected by leader.".format(worker_name=worker_name)
+        if not worker_names:
+            worker_names = _ALL_WORKER_NAMES
+            assert (
+                worker_name in worker_names
+            ), "{worker_name} is not expected by leader.".format(worker_name=worker_name)
         states = _all_gather_sequence_id_to_states[sequence_id]
         assert (
             worker_name not in states.gathered_objects
@@ -128,7 +135,7 @@ def _gather_to_leader(sequence_id, worker_name, obj):
             worker_name=worker_name, sequence_id=sequence_id
         )
         states.gathered_objects[worker_name] = obj
-        if _ALL_WORKER_NAMES == set(states.gathered_objects.keys()):
+        if worker_names == set(states.gathered_objects.keys()):
             states.proceed_signal.set()
 
 
@@ -172,7 +179,7 @@ def _wait_all():
             del _thread_local_var.future_list
 
 @_require_initialized
-def _all_gather(obj, timeout=UNSET_RPC_TIMEOUT):
+def _all_gather(obj, worker_names=None, timeout=UNSET_RPC_TIMEOUT):
     r"""
     This is similar to torch.distributed.all_gather(), but is using RPC. It
     picks the worker with the smallest name (alphabetic order) as the leader.
@@ -180,30 +187,39 @@ def _all_gather(obj, timeout=UNSET_RPC_TIMEOUT):
     has received all, it will broadcast the results back to all followers. This
     function blocks until all workers have received the gathered results.
     """
-    assert (
-        _ALL_WORKER_NAMES is not None
-    ), "`_ALL_WORKER_NAMES` is not initialized for `def _all_gather`."
-    leader_name = sorted(_ALL_WORKER_NAMES)[0]
+    if not worker_names:
+        assert (
+            _ALL_WORKER_NAMES is not None
+        ), "`_ALL_WORKER_NAMES` is not initialized for `def _all_gather`."
+        worker_names = _ALL_WORKER_NAMES
+    leader_name = sorted(worker_names)[0]
 
     self_name = _get_current_rpc_agent().get_worker_info().name
 
-    global _all_gather_sequence_id
-    with _all_gather_dict_lock:
-        sequence_id = _all_gather_sequence_id
-        _all_gather_sequence_id += 1
 
     is_leader = leader_name == self_name
     if timeout == UNSET_RPC_TIMEOUT:
         timeout = get_rpc_timeout()
 
+    if worker_names != _ALL_WORKER_NAMES:
+        # create hash of all worker names in group
+        concat_names = "".join(sorted(worker_names)).encode('utf-8')
+        sequence_id = hashlib.sha256(concat_names).hexdigest()
+    else:
+        # perform all_gather using all workers by incrementing global id
+        with _all_gather_dict_lock:
+            global _all_gather_sequence_id
+            sequence_id = _all_gather_sequence_id
+            _all_gather_sequence_id += 1
+
     # Phase 1: Followers send it's object to the leader
     if is_leader:
-        _gather_to_leader(sequence_id, self_name, obj)
+        _gather_to_leader(sequence_id, self_name, obj, worker_names)
     else:
         rpc_sync(
             leader_name,
             _gather_to_leader,
-            args=(sequence_id, self_name, obj),
+            args=(sequence_id, self_name, obj, worker_names),
             timeout=timeout,
         )
 
@@ -216,7 +232,7 @@ def _all_gather(obj, timeout=UNSET_RPC_TIMEOUT):
     # followers' data objects.
     if is_leader:
         worker_name_to_response_future_dict = dict()
-        for follower_name in _ALL_WORKER_NAMES - {leader_name}:
+        for follower_name in worker_names - {leader_name}:
             fut = rpc_async(
                 follower_name,
                 _broadcast_to_followers,
@@ -238,6 +254,9 @@ def _all_gather(obj, timeout=UNSET_RPC_TIMEOUT):
                 f"after {timeout:.2f} seconds. The first exception is {errors[0][1]}"
             )
 
+    # Clean up for the states using the sequence_id
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states.pop(sequence_id)
     return states.gathered_objects
 
 
